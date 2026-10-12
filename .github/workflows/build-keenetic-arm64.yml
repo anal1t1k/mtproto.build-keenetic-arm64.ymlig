@@ -23,17 +23,49 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Inspect source
+      - name: Patch curl executable
         shell: bash
         run: |
-          echo "=== child_process.zig ==="
-          grep -n -A 12 -B 3 'allocator.alloc.*options.argv.len' src/proxy/child_process.zig
-          echo "=== curl references ==="
-          grep -n -B 3 -A 5 '"curl"' src/proxy/http_fetch.zig
+          set -eu
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("src/proxy/http_fetch.zig")
+          s = p.read_text()
+
+          # Patch the standalone curl executable argument.
+          s, n1 = re.subn(
+              r'(?m)^(\s*)"curl",$',
+              r'\1"/opt/bin/curl",',
+              s,
+              count=1
+          )
+
+          # Patch curl in the argument array used for the fallback check.
+          s, n2 = re.subn(
+              r'(\{\s*)"curl",',
+              r'\1"/opt/bin/curl",',
+              s,
+              count=1
+          )
+
+          if n1 != 1 or n2 != 1:
+              raise SystemExit(
+                  f"curl patch failed: standalone={n1}, array={n2}"
+              )
+
+          if s.count('"/opt/bin/curl"') < 2:
+              raise SystemExit("Absolute curl path verification failed.")
+
+          p.write_text(s)
+          print("Both curl executable paths patched.")
+          PY
 
       - name: Patch child process PATH
         shell: bash
         run: |
+          set -eu
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -41,34 +73,61 @@ jobs:
           p = Path("src/proxy/child_process.zig")
           s = p.read_text()
 
-          # Increase argv capacity.
-          pattern = r'const argv = try allocator\.alloc\(\[\]const u8, options\.argv\.len \+ 2\);'
-          s, n = re.subn(pattern,
-                         'const argv = try allocator.alloc([]const u8, options.argv.len + 3);',
-                         s, count=1)
-          if n != 1:
+          s, n1 = re.subn(
+              r'const argv = try allocator\.alloc\(\[\]const u8, options\.argv\.len \+ 2\);',
+              'const argv = try allocator.alloc([]const u8, options.argv.len + 3);',
+              s,
+              count=1
+          )
+          if n1 != 1:
               raise SystemExit("Could not patch argv allocation.")
 
-          # Find the env arguments and insert PATH after the signal option.
-          pattern = r'(?m)^(\s*argv\[1\]\s*=\s*"--default-signal=TERM,INT,HUP,USR1";\s*)$'
-          s, n = re.subn(
-              pattern,
+          s, n2 = re.subn(
+              r'(?m)^(\s*argv\[1\]\s*=\s*"--default-signal=TERM,INT,HUP,USR1";\s*)$',
               r'\1\n          argv[2] = "PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:/usr/bin:/usr/sbin:/bin:/sbin";',
               s,
               count=1
           )
-          if n != 1:
-              raise SystemExit("Could not find the default-signal argv assignment.")
+          if n2 != 1:
+              raise SystemExit("Could not insert PATH.")
 
-          # Move the original argv copy to index 3.
-          pattern = r'@memcpy\(argv\[2\.\.\], options\.argv\);'
-          s, n = re.subn(pattern, '@memcpy(argv[3..], options.argv);', s, count=1)
-          if n != 1:
-              raise SystemExit("Could not find the original argv copy.")
+          s, n3 = re.subn(
+              r'@memcpy\(argv\[2\.\.\], options\.argv\);',
+              '@memcpy(argv[3..], options.argv);',
+              s,
+              count=1
+          )
+          if n3 != 1:
+              raise SystemExit("Could not move original argv.")
 
           p.write_text(s)
           print("PATH patch applied.")
           PY
+
+      - name: Verify patches
+        shell: bash
+        run: |
+          set -eu
+          python3 - <<'PY'
+          from pathlib import Path
+
+          http = Path("src/proxy/http_fetch.zig").read_text()
+          child = Path("src/proxy/child_process.zig").read_text()
+
+          if http.count('"/opt/bin/curl"') < 2:
+              raise SystemExit("ERROR: absolute curl paths missing")
+
+          if 'PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:/usr/bin:/usr/sbin:/bin:/sbin' not in child:
+              raise SystemExit("ERROR: child process PATH missing")
+
+          print("Verified: both curl paths and child process PATH are present.")
+          PY
+
+          echo "=== curl paths ==="
+          grep -n '"/opt/bin/curl"' src/proxy/http_fetch.zig
+
+          echo "=== child process PATH ==="
+          grep -n 'PATH=/opt/bin' src/proxy/child_process.zig
 
       - name: Build Linux ARM64 binary
         shell: bash
@@ -80,7 +139,6 @@ jobs:
         shell: bash
         run: |
           set -eu
-          find zig-out -type f -maxdepth 4 -print
           test -f zig-out/bin/mtproto-proxy
           file zig-out/bin/mtproto-proxy
           sha256sum zig-out/bin/mtproto-proxy
