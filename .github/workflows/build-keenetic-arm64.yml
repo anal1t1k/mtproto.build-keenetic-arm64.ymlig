@@ -31,18 +31,25 @@ jobs:
 
           p = Path("src/proxy/http_fetch.zig")
           s = p.read_text()
-          count = s.count('"curl"')
-          if count < 2:
-              raise SystemExit(
-                  f"Expected at least 2 curl string literals, found {count}; source unchanged."
-              )
 
-          s = s.replace('"curl"', '"/opt/bin/curl"')
-          if '"curl"' in s:
-              raise SystemExit("Some curl executable references remain unpatched.")
+          # Patch only executable arguments, not comments or documentation.
+          replacements = [
+              ('"curl",', '"/opt/bin/curl",'),
+              ('{ "curl",', '{ "/opt/bin/curl",'),
+          ]
+
+          total = 0
+          for old, new in replacements:
+              count = s.count(old)
+              if count:
+                  s = s.replace(old, new)
+                  total += count
+
+          if total == 0:
+              raise SystemExit("No curl executable references were patched.")
 
           p.write_text(s)
-          print(f"Patched {count} curl string literals.")
+          print(f"Patched {total} curl reference(s).")
           PY
 
       - name: Patch child process PATH
@@ -54,47 +61,47 @@ jobs:
           p = Path("src/proxy/child_process.zig")
           s = p.read_text()
 
-          old_alloc = (
-              "const argv = try allocator.alloc([]const u8, "
-              "options.argv.len + 2);"
-          )
-          new_alloc = (
-              "const argv = try allocator.alloc([]const u8, "
-              "options.argv.len + 3);"
-          )
+          old_alloc = "const argv = try allocator.alloc([]const u8, options.argv.len + 2);"
+          new_alloc = "const argv = try allocator.alloc([]const u8, options.argv.len + 3);"
 
           if s.count(old_alloc) != 1:
-              raise SystemExit("Could not uniquely identify child argv allocation.")
+              raise SystemExit("Could not identify argv allocation; no changes made.")
           s = s.replace(old_alloc, new_alloc, 1)
 
-          old_block = '''argv[0] = "/opt/bin/env";
+          old_env = '''argv[0] = "/usr/bin/env";
+          argv[1] = "--default-signal=TERM,INT,HUP,USR1";'''
+
+          new_env = '''argv[0] = "/usr/bin/env";
           argv[1] = "--default-signal=TERM,INT,HUP,USR1";
-          @memcpy(argv[2..], options.argv);'''
+          argv[2] = "PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:/usr/bin:/usr/sbin:/bin:/sbin";'''
 
-          new_block = '''argv[0] = "/opt/bin/env";
-          argv[1] = "--default-signal=TERM,INT,HUP,USR1";
-          argv[2] = "PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
-          @memcpy(argv[3..], options.argv);'''
+          if s.count(old_env) != 1:
+              raise SystemExit("Could not identify env arguments; no changes made.")
+          s = s.replace(old_env, new_env, 1)
 
-          if s.count(old_block) != 1:
-              raise SystemExit(
-                  "Could not uniquely identify child argv block; inspect source."
-              )
+          old_copy = "@memcpy(argv[2..], options.argv);"
+          new_copy = "@memcpy(argv[3..], options.argv);"
 
-          s = s.replace(old_block, new_block, 1)
+          if s.count(old_copy) != 1:
+              raise SystemExit("Could not identify argv copy; no changes made.")
+          s = s.replace(old_copy, new_copy, 1)
+
           p.write_text(s)
 
-          assert 'options.argv.len + 3' in s
-          assert 'PATH=/opt/bin:/opt/sbin' in s
-          assert '@memcpy(argv[3..], options.argv);' in s
+          assert "options.argv.len + 3" in s
+          assert "PATH=/opt/bin:/opt/sbin" in s
+          assert "@memcpy(argv[3..], options.argv);" in s
           print("Child process PATH patch verified.")
           PY
 
       - name: Build Linux ARM64 binary
+        shell: bash
         run: |
+          set -eux
           zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
 
       - name: Verify binary
+        shell: bash
         run: |
           set -eu
           test -f zig-out/bin/mtproto-proxy
@@ -102,14 +109,14 @@ jobs:
           sha256sum zig-out/bin/mtproto-proxy
 
       - name: Prepare artifact
+        shell: bash
         run: |
+          set -eu
           mkdir -p artifact
-          cp zig-out/bin/mtproto-proxy \
-            artifact/mtproto-proxy-linux-aarch64
+          cp zig-out/bin/mtproto-proxy artifact/mtproto-proxy-linux-aarch64
           cp src/proxy/http_fetch.zig artifact/
           cp src/proxy/child_process.zig artifact/
-          sha256sum artifact/mtproto-proxy-linux-aarch64 \
-            > artifact/SHA256SUMS
+          sha256sum artifact/mtproto-proxy-linux-aarch64 > artifact/SHA256SUMS
 
       - name: Upload ARM64 binary and patched sources
         uses: actions/upload-artifact@v4
