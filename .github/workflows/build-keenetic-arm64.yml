@@ -1,5 +1,5 @@
 
-name: Build Keenetic ARM64 diagnostic
+name: Keenetic ARM64 diagnostic build
 
 on:
   workflow_dispatch:
@@ -10,60 +10,33 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-
     steps:
-      - name: Checkout source
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
-        with:
-          repository: sleep3r/mtproto.zig
-          ref: v1.15.4
 
-      - name: Setup Zig
+      - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
-      - name: Patch curl executable
-        shell: bash
+      - name: Download mtproto.zig v1.15.4
         run: |
-          set -eu
+          git clone --depth 1 --branch v1.15.4 \
+            https://github.com/sleep3r/mtproto.zig.git mtproto-src
+
+      - name: Add spawn diagnostics
+        working-directory: mtproto-src
+        run: |
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
           p = Path("src/proxy/http_fetch.zig")
           s = p.read_text()
-
-          s, n1 = re.subn(
-              r'(?m)^(\s*)"curl",$',
-              r'\1"/opt/bin/curl",',
-              s,
-              count=1
-          )
-          s, n2 = re.subn(
-              r'(\{\s*)"curl",',
-              r'\1"/opt/bin/curl",',
-              s,
-              count=1
-          )
-
-          if n1 != 1 or n2 != 1:
-              raise SystemExit(
-                  f"curl patch failed: standalone={n1}, array={n2}"
-              )
-
-          if s.count('"/opt/bin/curl"') < 2:
-              raise SystemExit("Absolute curl path verification failed.")
-
+          s = s.replace('"/usr/bin/curl"', '"/opt/bin/curl"')
           p.write_text(s)
-          print("Both curl paths patched.")
-          PY
 
-      - name: Disable env wrapper for diagnosis
-        shell: bash
-        run: |
-          set -eu
-          cat > src/proxy/child_process.zig <<'ZIG'
+          p = Path("src/proxy/child_process.zig")
+          p.write_text(r'''
           const std = @import("std");
 
           pub fn run(
@@ -82,52 +55,48 @@ jobs:
                   };
               }
 
-              return std.process.run(allocator, io, options);
+              std.debug.print(
+                  "[mtproxy-diag] spawn argc={d}\n",
+                  .{options.argv.len},
+              );
+
+              for (options.argv, 0..) |arg, i| {
+                  std.debug.print(
+                      "[mtproxy-diag] argv[{d}]={s}\n",
+                      .{ i, arg },
+                  );
+              }
+
+              const result = std.process.run(
+                  allocator,
+                  io,
+                  options,
+              ) catch |err| {
+                  std.debug.print(
+                      "[mtproxy-diag] spawn error={s}\n",
+                      .{@errorName(err)},
+                  );
+                  return err;
+              };
+
+              return result;
           }
-          ZIG
+          ''')
+          PY
 
-          echo "Diagnostic wrapper removed."
-          cat src/proxy/child_process.zig
-
-      - name: Verify diagnostic patches
-        shell: bash
+      - name: Build diagnostic binary
+        working-directory: mtproto-src
         run: |
-          set -eu
-          grep -n '"/opt/bin/curl"' src/proxy/http_fetch.zig
-          grep -n 'return std.process.run' src/proxy/child_process.zig
-          if grep -q '/opt/bin/env' src/proxy/child_process.zig; then
-            echo "ERROR: env wrapper still present"
-            exit 1
-          fi
-
-      - name: Build Linux ARM64 binary
-        shell: bash
-        run: |
-          set -eux
-          zig version
           zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
-
-      - name: Verify binary
-        shell: bash
-        run: |
-          set -eu
-          test -f zig-out/bin/mtproto-proxy
-          file zig-out/bin/mtproto-proxy
-          sha256sum zig-out/bin/mtproto-proxy
-
-      - name: Prepare artifact
-        shell: bash
-        run: |
-          set -eu
-          mkdir -p artifact
-          cp zig-out/bin/mtproto-proxy artifact/mtproto-proxy-linux-aarch64
-          cp src/proxy/http_fetch.zig artifact/
-          cp src/proxy/child_process.zig artifact/
-          sha256sum artifact/mtproto-proxy-linux-aarch64 > artifact/SHA256SUMS
+          mkdir -p ../diagnostic
+          cp zig-out/bin/mtproto-proxy \
+            ../diagnostic/mtproto-proxy-linux-aarch64
+          sha256sum ../diagnostic/mtproto-proxy-linux-aarch64 \
+            | tee ../diagnostic/SHA256SUMS
 
       - name: Upload diagnostic binary
         uses: actions/upload-artifact@v4
         with:
           name: mtproto-keenetic-arm64-diagnostic
-          path: artifact/
-          if-no-files-found: error
+          path: diagnostic/
+          retention-days: 7
