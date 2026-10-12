@@ -10,8 +10,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
+
     steps:
-      - name: Checkout workflow repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Zig
@@ -19,24 +20,28 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Download mtproto.zig v1.15.4
+      - name: Download upstream source
         run: |
           git clone --depth 1 --branch v1.15.4 \
             https://github.com/sleep3r/mtproto.zig.git mtproto-src
 
-      - name: Add spawn diagnostics
-        working-directory: mtproto-src
+      - name: Patch and verify source
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          p = Path("src/proxy/http_fetch.zig")
-          s = p.read_text()
-          s = s.replace('"/usr/bin/curl"', '"/opt/bin/curl"')
-          p.write_text(s)
+          root = Path("mtproto-src")
+          http = root / "src/proxy/http_fetch.zig"
+          child = root / "src/proxy/child_process.zig"
 
-          p = Path("src/proxy/child_process.zig")
-          p.write_text(r'''
+          s = http.read_text()
+          if '"/opt/bin/curl"' not in s:
+              raise SystemExit(
+                  "ERROR: expected /opt/bin/curl is absent from http_fetch.zig"
+              )
+          print("Verified: http_fetch.zig contains /opt/bin/curl")
+
+          child.write_text(r'''
           const std = @import("std");
 
           pub fn run(
@@ -56,7 +61,7 @@ jobs:
               }
 
               std.debug.print(
-                  "[mtproxy-diag] spawn argc={d}\n",
+                  "[mtproxy-diag] argc={d}\n",
                   .{options.argv.len},
               );
 
@@ -82,17 +87,30 @@ jobs:
               return result;
           }
           ''')
+
+          print("Diagnostic child_process.zig installed")
           PY
 
-      - name: Build diagnostic binary
+      - name: Build
         working-directory: mtproto-src
         run: |
           zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
+
+      - name: Verify binary
+        working-directory: mtproto-src
+        run: |
+          test -f zig-out/bin/mtproto-proxy
+          file zig-out/bin/mtproto-proxy
+          sha256sum zig-out/bin/mtproto-proxy
+
+      - name: Prepare artifact
+        working-directory: mtproto-src
+        run: |
           mkdir -p ../diagnostic
           cp zig-out/bin/mtproto-proxy \
             ../diagnostic/mtproto-proxy-linux-aarch64
           sha256sum ../diagnostic/mtproto-proxy-linux-aarch64 \
-            | tee ../diagnostic/SHA256SUMS
+            > ../diagnostic/SHA256SUMS
 
       - name: Upload diagnostic binary
         uses: actions/upload-artifact@v4
