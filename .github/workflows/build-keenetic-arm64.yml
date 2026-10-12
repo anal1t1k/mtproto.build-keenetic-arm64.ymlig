@@ -25,39 +25,105 @@ jobs:
           git clone --depth 1 --branch v1.15.4 \
             https://github.com/sleep3r/mtproto.zig.git mtproto-src
 
-      - name: Patch and verify source
+      - name: Patch curl and DNS fallback
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import re
 
           root = Path("mtproto-src")
+
           http = root / "src/proxy/http_fetch.zig"
+          net = root / "src/proxy/net_helpers.zig"
           child = root / "src/proxy/child_process.zig"
 
+          # Use the known Entware curl path.
           s = http.read_text()
-
-          # Replace "curl", "/usr/bin/curl", or any other absolute curl path.
           s, count = re.subn(
               r'"(?:[^"]*/)?curl"',
               '"/opt/bin/curl"',
               s,
           )
-
           if count == 0:
-              print("ERROR: curl executable was not found in source.")
-              for i, line in enumerate(http.read_text().splitlines(), 1):
-                  if "curl" in line.lower():
-                      print(f"{i}: {line}")
-              raise SystemExit(1)
-
-          if '"/opt/bin/curl"' not in s:
-              raise SystemExit("ERROR: curl path replacement failed")
-
+              raise SystemExit("ERROR: curl path was not found")
           http.write_text(s)
-          print(f"Patched {count} curl path occurrence(s)")
-          print("Verified: /opt/bin/curl")
+          print(f"Patched curl path occurrences: {count}")
 
+          # Replace the missing getent fallback with BusyBox/Entware nslookup.
+          s = net.read_text()
+
+          old_argv = '.argv = &.{ "getent", "ahosts", "--", host },'
+          new_argv = '.argv = &.{ "/opt/bin/nslookup", host, "127.0.0.1" },'
+
+          if old_argv not in s:
+              raise SystemExit("ERROR: getent argv pattern not found")
+          s = s.replace(old_argv, new_argv, 1)
+
+          old_parser_call = "return parseGetentAhosts(allocator, result.stdout, port);"
+          new_parser_call = "return parseNslookup(allocator, result.stdout, port);"
+
+          if old_parser_call not in s:
+              raise SystemExit("ERROR: getent parser call not found")
+          s = s.replace(old_parser_call, new_parser_call, 1)
+
+          marker = "/// Parse `getent ahosts"
+          if marker not in s:
+              raise SystemExit("ERROR: DNS parser insertion point not found")
+
+          parser = r'''
+          fn parseNslookup(
+              allocator: std.mem.Allocator,
+              stdout: []const u8,
+              port: u16,
+          ) !AddressList {
+              var addrs: std.ArrayList(Address) = .empty;
+              defer addrs.deinit(allocator);
+
+              var answer_section = false;
+              var lines = std.mem.tokenizeAny(u8, stdout, "\r\n");
+
+              while (lines.next()) |line| {
+                  const trimmed = std.mem.trimStart(u8, line, " \t");
+
+                  if (std.mem.startsWith(u8, trimmed, "Name:")) {
+                      answer_section = true;
+                      continue;
+                  }
+
+                  if (!answer_section) continue;
+
+                  var tokens = std.mem.tokenizeAny(u8, trimmed, " \t");
+                  while (tokens.next()) |token| {
+                      const addr = net.IpAddress.parse(token, port) catch continue;
+
+                      var duplicate = false;
+                      for (addrs.items) |existing| {
+                          if (net.IpAddress.eql(&existing, &addr)) {
+                              duplicate = true;
+                              break;
+                          }
+                      }
+
+                      if (!duplicate) try addrs.append(allocator, addr);
+                  }
+              }
+
+              if (addrs.items.len == 0) return error.NoAddressReturned;
+
+              preferIpv4(addrs.items);
+
+              return .{
+                  .allocator = allocator,
+                  .addrs = try addrs.toOwnedSlice(allocator),
+              };
+          }
+
+          '''
+          s = s.replace(marker, parser + marker, 1)
+          net.write_text(s)
+          print("Patched DNS fallback to /opt/bin/nslookup")
+
+          # Retain child-process diagnostics for this test build.
           child.write_text(r'''
           const std = @import("std");
 
@@ -78,7 +144,7 @@ jobs:
               }
 
               std.debug.print(
-                  "[mtproxy-diag] argc={d}\n",
+                  "[mtproxy-diag] spawn argc={d}\n",
                   .{options.argv.len},
               );
 
