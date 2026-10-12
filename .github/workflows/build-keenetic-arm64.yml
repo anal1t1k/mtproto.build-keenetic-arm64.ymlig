@@ -1,5 +1,5 @@
 
-name: Build Keenetic ARM64
+name: Build Keenetic ARM64 diagnostic
 
 on:
   workflow_dispatch:
@@ -34,15 +34,12 @@ jobs:
           p = Path("src/proxy/http_fetch.zig")
           s = p.read_text()
 
-          # Patch the standalone curl executable argument.
           s, n1 = re.subn(
               r'(?m)^(\s*)"curl",$',
               r'\1"/opt/bin/curl",',
               s,
               count=1
           )
-
-          # Patch curl in the argument array used for the fallback check.
           s, n2 = re.subn(
               r'(\{\s*)"curl",',
               r'\1"/opt/bin/curl",',
@@ -59,80 +56,55 @@ jobs:
               raise SystemExit("Absolute curl path verification failed.")
 
           p.write_text(s)
-          print("Both curl executable paths patched.")
+          print("Both curl paths patched.")
           PY
 
-      - name: Patch child process PATH
+      - name: Disable env wrapper for diagnosis
         shell: bash
         run: |
           set -eu
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
+          cat > src/proxy/child_process.zig <<'ZIG'
+          const std = @import("std");
 
-          p = Path("src/proxy/child_process.zig")
-          s = p.read_text()
+          pub fn run(
+              allocator: std.mem.Allocator,
+              io: std.Io,
+              requested: std.process.RunOptions,
+          ) !std.process.RunResult {
+              var options = requested;
 
-          s, n1 = re.subn(
-              r'const argv = try allocator\.alloc\(\[\]const u8, options\.argv\.len \+ 2\);',
-              'const argv = try allocator.alloc([]const u8, options.argv.len + 3);',
-              s,
-              count=1
-          )
-          if n1 != 1:
-              raise SystemExit("Could not patch argv allocation.")
+              if (options.timeout == .none) {
+                  options.timeout = .{
+                      .duration = .{
+                          .raw = .fromSeconds(12),
+                          .clock = .awake,
+                      },
+                  };
+              }
 
-          s, n2 = re.subn(
-              r'(?m)^(\s*argv\[1\]\s*=\s*"--default-signal=TERM,INT,HUP,USR1";\s*)$',
-              r'\1\n          argv[2] = "PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:/usr/bin:/usr/sbin:/bin:/sbin";',
-              s,
-              count=1
-          )
-          if n2 != 1:
-              raise SystemExit("Could not insert PATH.")
+              return std.process.run(allocator, io, options);
+          }
+          ZIG
 
-          s, n3 = re.subn(
-              r'@memcpy\(argv\[2\.\.\], options\.argv\);',
-              '@memcpy(argv[3..], options.argv);',
-              s,
-              count=1
-          )
-          if n3 != 1:
-              raise SystemExit("Could not move original argv.")
+          echo "Diagnostic wrapper removed."
+          cat src/proxy/child_process.zig
 
-          p.write_text(s)
-          print("PATH patch applied.")
-          PY
-
-      - name: Verify patches
+      - name: Verify diagnostic patches
         shell: bash
         run: |
           set -eu
-          python3 - <<'PY'
-          from pathlib import Path
-
-          http = Path("src/proxy/http_fetch.zig").read_text()
-          child = Path("src/proxy/child_process.zig").read_text()
-
-          if http.count('"/opt/bin/curl"') < 2:
-              raise SystemExit("ERROR: absolute curl paths missing")
-
-          if 'PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:/usr/bin:/usr/sbin:/bin:/sbin' not in child:
-              raise SystemExit("ERROR: child process PATH missing")
-
-          print("Verified: both curl paths and child process PATH are present.")
-          PY
-
-          echo "=== curl paths ==="
           grep -n '"/opt/bin/curl"' src/proxy/http_fetch.zig
-
-          echo "=== child process PATH ==="
-          grep -n 'PATH=/opt/bin' src/proxy/child_process.zig
+          grep -n 'return std.process.run' src/proxy/child_process.zig
+          if grep -q '/opt/bin/env' src/proxy/child_process.zig; then
+            echo "ERROR: env wrapper still present"
+            exit 1
+          fi
 
       - name: Build Linux ARM64 binary
         shell: bash
         run: |
           set -eux
+          zig version
           zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
 
       - name: Verify binary
@@ -153,9 +125,9 @@ jobs:
           cp src/proxy/child_process.zig artifact/
           sha256sum artifact/mtproto-proxy-linux-aarch64 > artifact/SHA256SUMS
 
-      - name: Upload ARM64 binary and patched sources
+      - name: Upload diagnostic binary
         uses: actions/upload-artifact@v4
         with:
-          name: mtproto-keenetic-arm64
+          name: mtproto-keenetic-arm64-diagnostic
           path: artifact/
           if-no-files-found: error
