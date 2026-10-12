@@ -1,1 +1,119 @@
 
+name: Build Keenetic ARM64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: sleep3r/mtproto.zig
+          ref: v1.15.4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Patch curl executable
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/proxy/http_fetch.zig")
+          s = p.read_text()
+          count = s.count('"curl"')
+          if count < 2:
+              raise SystemExit(
+                  f"Expected at least 2 curl string literals, found {count}; source unchanged."
+              )
+
+          s = s.replace('"curl"', '"/opt/bin/curl"')
+          if '"curl"' in s:
+              raise SystemExit("Some curl executable references remain unpatched.")
+
+          p.write_text(s)
+          print(f"Patched {count} curl string literals.")
+          PY
+
+      - name: Patch child process PATH
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/proxy/child_process.zig")
+          s = p.read_text()
+
+          old_alloc = (
+              "const argv = try allocator.alloc([]const u8, "
+              "options.argv.len + 2);"
+          )
+          new_alloc = (
+              "const argv = try allocator.alloc([]const u8, "
+              "options.argv.len + 3);"
+          )
+
+          if s.count(old_alloc) != 1:
+              raise SystemExit("Could not uniquely identify child argv allocation.")
+          s = s.replace(old_alloc, new_alloc, 1)
+
+          old_block = '''argv[0] = "/opt/bin/env";
+          argv[1] = "--default-signal=TERM,INT,HUP,USR1";
+          @memcpy(argv[2..], options.argv);'''
+
+          new_block = '''argv[0] = "/opt/bin/env";
+          argv[1] = "--default-signal=TERM,INT,HUP,USR1";
+          argv[2] = "PATH=/opt/bin:/opt/sbin:/opt/usr/bin:/opt/usr/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
+          @memcpy(argv[3..], options.argv);'''
+
+          if s.count(old_block) != 1:
+              raise SystemExit(
+                  "Could not uniquely identify child argv block; inspect source."
+              )
+
+          s = s.replace(old_block, new_block, 1)
+          p.write_text(s)
+
+          assert 'options.argv.len + 3' in s
+          assert 'PATH=/opt/bin:/opt/sbin' in s
+          assert '@memcpy(argv[3..], options.argv);' in s
+          print("Child process PATH patch verified.")
+          PY
+
+      - name: Build Linux ARM64 binary
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
+
+      - name: Verify binary
+        run: |
+          set -eu
+          test -f zig-out/bin/mtproto-proxy
+          file zig-out/bin/mtproto-proxy
+          sha256sum zig-out/bin/mtproto-proxy
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifact
+          cp zig-out/bin/mtproto-proxy \
+            artifact/mtproto-proxy-linux-aarch64
+          cp src/proxy/http_fetch.zig artifact/
+          cp src/proxy/child_process.zig artifact/
+          sha256sum artifact/mtproto-proxy-linux-aarch64 \
+            > artifact/SHA256SUMS
+
+      - name: Upload ARM64 binary and patched sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtproto-keenetic-arm64
+          path: artifact/
+          if-no-files-found: error
