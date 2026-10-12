@@ -29,17 +29,34 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           root = Path("mtproto-src")
           http = root / "src/proxy/http_fetch.zig"
           child = root / "src/proxy/child_process.zig"
 
           s = http.read_text()
+
+          # Replace "curl", "/usr/bin/curl", or any other absolute curl path.
+          s, count = re.subn(
+              r'"(?:[^"]*/)?curl"',
+              '"/opt/bin/curl"',
+              s,
+          )
+
+          if count == 0:
+              print("ERROR: curl executable was not found in source.")
+              for i, line in enumerate(http.read_text().splitlines(), 1):
+                  if "curl" in line.lower():
+                      print(f"{i}: {line}")
+              raise SystemExit(1)
+
           if '"/opt/bin/curl"' not in s:
-              raise SystemExit(
-                  "ERROR: expected /opt/bin/curl is absent from http_fetch.zig"
-              )
-          print("Verified: http_fetch.zig contains /opt/bin/curl")
+              raise SystemExit("ERROR: curl path replacement failed")
+
+          http.write_text(s)
+          print(f"Patched {count} curl path occurrence(s)")
+          print("Verified: /opt/bin/curl")
 
           child.write_text(r'''
           const std = @import("std");
